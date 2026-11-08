@@ -1,0 +1,26 @@
+# 生成物
+/dist/
+
+# 収集データ・投稿本文・判定結果・成果物はリポジトリに入れない（個人情報を含むため）
+/data/
+/runs/
+*.jsonl
+collection_bundle_*.json
+analysis_bundle_*.json
+comparison_summary_*.csv
+report_*.md
+collection_report_*.md
+coding_report_*.md
+
+# 認証情報
+.env
+*.key
+secrets*
+
+# Python
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
+Thumbs.db

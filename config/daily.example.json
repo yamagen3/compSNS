@@ -1,0 +1,39 @@
+{
+  "config_schema": "SNS-CONFIG-1.0",
+  "mode": "DAILY",
+  "status": "TEMPLATE",
+  "notice": "日常用の設定ひな型。nullは未確定（ゼロや無制限を意味しない）。値を入れたものを config/runs/{run_id}.json としてコミットしてから使う。ROLEとMODEはbuild_prompt.pyが設定する。",
+  "placeholders": {
+    "CONFIG_VERSION": null,
+    "PHASE": null,
+    "PERIOD_START_JST": null,
+    "PERIOD_END_JST": null,
+    "OPERATION_START_JST": null,
+    "GAZETTEER_NATIONAL_VERSION": null,
+    "LANG_DETECTOR_SPEC": null,
+    "SAMPLING_DESIGN_ID": null,
+    "SAMPLING_SEED": null,
+    "WINDOW_LIST_VERSION": null,
+    "COMMON_BUDGET": null,
+    "CODEBOOK_VERSION": null,
+    "TOPIC_DICTIONARY_VERSION_OR_NOT_BUILT": null,
+    "COMMON_CODER_SPEC": null,
+    "OFFICIAL_SURFACE_SLOTS": null,
+    "RETRIEVAL_LAG_MINUTES": null,
+    "MIN_WINDOW_SECONDS": null,
+    "BOOTSTRAP_REPS": null,
+    "PRIOR_STRENGTH": null,
+    "PREVIOUS_DATA_OR_NONE": null
+  },
+  "proposed_defaults": {
+    "status": "PROPOSED_NOT_EFFECTIVE",
+    "note": "参考値。build_prompt.pyはこの欄を使わない。PILOTで確定したらplaceholdersへ移す。",
+    "OFFICIAL_SURFACE_SLOTS": "JST 00・04・08・12・16・20時",
+    "RETRIEVAL_LAG_MINUTES": "60分",
+    "MIN_WINDOW_SECONDS": "15秒",
+    "BOOTSTRAP_REPS": "2,000回",
+    "PRIOR_STRENGTH": "n_Xとn_Tの小さい方の10%",
+    "window_length_minutes": 2,
+    "windows_per_stratum": 4
+  }
+}
