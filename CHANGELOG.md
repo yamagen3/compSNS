@@ -2,6 +2,16 @@
 
 版の付け方は README.md の「版の管理」を参照してください。
 
+## [未リリース]
+
+読み比べ用 reading.md 1.0.0（共通部分 core.md 4.1.0／日常用 daily.md 1.0.0／深掘り用 deep-dive.md 1.0.0 は変更なし）
+
+### 追加
+- 読み比べ用（protocol/reading.md）：各SNSの検索AIに、同じ日に同じ問いを渡し、返ってきた投稿を並べて読むモード。設計水準N。共通部分とは結合しない単独の文書。お題型（THEME）と対比型（CONTRAST）、問いのひな型、人による確認、記録、発信するときの規則、限界。
+- 読み比べ用の設定ひな型（config/reading.example.json）。
+- tools/check.py：読み比べ用の冒頭・設定ひな型・表・節の参照・コードブロックを点検。
+- .gitignore：読み比べ用の記録（reading_log_*、reading_posts_*）を除外。
+
 ## [4.1.0] - 2026-11-09
 
 共通部分 core.md 4.1.0／日常用 daily.md 1.0.0／深掘り用 deep-dive.md 1.0.0

@@ -9,9 +9,11 @@ protocol/
   core.md          共通部分（全モード共通。目的、役割、地域フレーム、標本設計、分類、推定・比較、品質、出力仕様）
   daily.md         日常用（全国 NATIONAL_JP を週単位で継続観測）
   deep-dive.md     深掘り用（指定地域・期間限定）
+  reading.md       読み比べ用（各SNSの検索AIに同じ問いを渡して並べて読む。単独で使う。集計なし）
 config/
   daily.example.json       日常用の設定ひな型
   deep-dive.example.json   深掘り用の設定ひな型
+  reading.example.json     読み比べ用の設定ひな型
   runs/                    実際に使った設定（run_id ごとに1ファイル）
 gazetteers/
   TEMPLATE.csv     地名辞典のひな型
@@ -24,7 +26,7 @@ docs/
 CHANGELOG.md       変更履歴
 ```
 
-共通部分は `protocol/core.md` の1ファイルだけです。日常用と深掘り用は、それぞれ別のファイルで管理し、使うときに共通部分と結合します。
+共通部分は `protocol/core.md` の1ファイルだけです。日常用と深掘り用は、それぞれ別のファイルで管理し、使うときに共通部分と結合します。読み比べ用 `protocol/reading.md` は共通部分と結合せず、単独で使います（後述）。
 
 ## 使い方
 
@@ -51,12 +53,25 @@ Python 3.8以上が必要です（追加のライブラリは不要）。Windows
 | common_coder | 第三の実行者を推奨 | dist/{mode}/common_coder.md |
 | integrator | 人または第三の実行者 | dist/{mode}/integrator.md |
 
+## 読み比べ用（AI経由）の使い方
+
+各SNSの検索AI（例：XはGrokBot、ThreadsはMuse）に、同じ日に同じ問いを渡し、返ってきた投稿を並べて読むモードです。設計水準はN（`core.md` 第7.4節）で、割合・順位・SNS間の判定は出しません。`tools/build_prompt.py` は使いません。
+
+1. **設定を作る**：`config/reading.example.json` をコピーし、お題・期間・比べるSNSとAIを入れて `config/runs/` に置きます（例：`config/runs/READ-20261116-heartwarming.json`）。
+2. **点検してコミットする**：`python tools/check.py` を通し、問いを渡す前にコミットします。
+3. **問いを渡す**：`protocol/reading.md` Y4 のひな型を、SNS名とお題だけ替えて、各AIに新しい会話で渡します。
+4. **確認する**：AIが挙げた投稿を1件ずつ開いて確かめます（Y5）。使うのは確認できた投稿だけです。
+5. **発信する**：言い方と必ず添える一文は Y7、限界は Y8 に従います。
+
+渡した問い・回答の全文・確認結果はリポジトリに入れません（Y6）。
+
 ## 版の管理
 
 各文書の冒頭（`---` で囲んだ部分）に版があります。
 
 - 共通部分 `core.md`：4.x.y（protocol_id は SNS-COMPARE-4.x）
 - 日常用 `daily.md`・深掘り用 `deep-dive.md`：1.x.y。冒頭の `requires_core` で、組み合わせられる共通部分の版を指定します。
+- 読み比べ用 `reading.md`：1.x.y。単独の文書（冒頭に `standalone: true`）で、共通部分の版には連動しません。
 
 版の上げ方：
 
@@ -81,7 +96,7 @@ Python 3.8以上が必要です（追加のライブラリは不要）。Windows
 
 ## リポジトリに入れないもの
 
-収集した投稿・本文・判定結果・成果物のデータ（collection_bundle、coded_posts、analysis_bundle など）、認証情報・APIキーは入れません。個人情報を含み、履歴から消すのが難しいためです。別の保存先に置き、保存先と保管期限をレポートに書きます。`.gitignore` で主なものを除外していますが、コミット前に確認してください。
+収集した投稿・本文・判定結果・成果物のデータ（collection_bundle、coded_posts、analysis_bundle、読み比べ用の reading_log・reading_posts など）、認証情報・APIキーは入れません。個人情報を含み、履歴から消すのが難しいためです。別の保存先に置き、保存先と保管期限をレポートに書きます。`.gitignore` で主なものを除外していますが、コミット前に確認してください。
 
 ## 履歴と関連資料
 
