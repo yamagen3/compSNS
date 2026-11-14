@@ -11,6 +11,8 @@ comparison_summary_*.csv
 report_*.md
 collection_report_*.md
 coding_report_*.md
+reading_log_*.md
+reading_posts_*.csv
 
 # 認証情報
 .env

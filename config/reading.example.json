@@ -1,0 +1,30 @@
+{
+  "config_schema": "SNS-CONFIG-1.0",
+  "mode": "READING",
+  "status": "TEMPLATE",
+  "notice": "読み比べ用（AI経由）の設定ひな型。nullは未確定（ゼロや無制限を意味しない）。値を入れたものを config/runs/{run_id}.json として、問いを渡す前にコミットする。build_prompt.py は使わない。SNS_NAME と THEME は、問いごとに PLATFORMS と THEMES から入れる。",
+  "placeholders": {
+    "READING_TYPE": null,
+    "THEMES": null,
+    "PLATFORMS": null,
+    "ASKED_ON_JST": null,
+    "PERIOD_FIRST_DAY": null,
+    "PERIOD_LAST_DAY": null,
+    "LANGUAGE": null,
+    "POSTS_PER_QUERY": null,
+    "MIN_VERIFIED_PER_SNS": null
+  },
+  "proposed_defaults": {
+    "status": "PROPOSED_NOT_EFFECTIVE",
+    "note": "参考値。試行で確かめてから placeholders へ移す。",
+    "READING_TYPE": "THEME または CONTRAST",
+    "THEMES": ["心温まる話"],
+    "PLATFORMS": [
+      {"sns_name": "X", "ai": "GrokBot"},
+      {"sns_name": "Threads", "ai": "Muse"}
+    ],
+    "LANGUAGE": "日本語",
+    "POSTS_PER_QUERY": "10",
+    "MIN_VERIFIED_PER_SNS": "3件"
+  }
+}
