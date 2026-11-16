@@ -16,10 +16,12 @@ reading_posts_*.csv
 
 # 認証情報
 .env
+.env.*
 *.key
 secrets*
 
 # Python
+/.venv-r2/
 __pycache__/
 *.pyc
 

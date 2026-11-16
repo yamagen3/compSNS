@@ -1,0 +1,4 @@
+# Optional R2 network commands only (Python >=3.10); core tools remain stdlib-only.
+# Current official boto3 release verified 2026-11-17: 1.44.4.
+# https://docs.aws.amazon.com/boto3/latest/guide/quickstart.html
+boto3>=1.44.4,<1.45
