@@ -4,6 +4,10 @@
 Objects are kept per run, per source platform (x / threads / both) and per role:
     {prefix}/runs/{run_id}/{platform}/{role}/{sha256}/{filename}
 
+Each platform can live in its own bucket (COMPSNS_R2_BUCKET_X / _THREADS / _BOTH),
+so write permission is separated by bucket while one read-only key reads all.
+A single bucket (COMPSNS_R2_BUCKET) is also supported, without that separation.
+
 Offline ``plan``, ``locate --local`` and imports use only the standard library.
 Network commands require Python 3.10+ and requirements-r2.txt. No bucket or
 public access is created. Deletion is manual: ``delete`` only lists what it
@@ -190,6 +194,49 @@ def plan_file(prefix: str, run_id: str, role: str, file_path, platform=None) -> 
     return _prepare(prefix, run_id, role, file_path, platform)[0]
 
 
+class Store:
+    """Buckets per platform plus a read client and an optional write client."""
+
+    def __init__(self, buckets: dict, read_client, write_client=None):
+        if set(buckets) != set(PLATFORMS):
+            raise ValueError("Give a bucket for each of: x, threads, both.")
+        self.buckets = dict(buckets)
+        self.read_client = read_client
+        self.write_client = write_client
+
+    @property
+    def partitioned(self) -> bool:
+        return len(set(self.buckets.values())) > 1
+
+    def bucket(self, platform: str) -> str:
+        return self.buckets[platform]
+
+    def platforms_by_bucket(self) -> dict:
+        result = {}
+        for platform in PLATFORMS:
+            result.setdefault(self.buckets[platform], []).append(platform)
+        return result
+
+    def writer(self):
+        if self.write_client is None:
+            raise ValueError("This command needs a write key "
+                             "(COMPSNS_R2_WRITE_ACCESS_KEY_ID and COMPSNS_R2_WRITE_SECRET_ACCESS_KEY).")
+        return self.write_client
+
+
+def _error_code(exc: Exception):
+    response = getattr(exc, "response", {})
+    if not isinstance(response, dict):
+        return None, None
+    return (response.get("Error", {}).get("Code"),
+            response.get("ResponseMetadata", {}).get("HTTPStatusCode"))
+
+
+def _access_denied(exc: Exception) -> bool:
+    code, status = _error_code(exc)
+    return code in ("AccessDenied", "Forbidden", "403") or status == 403
+
+
 def _precondition_failed(exc: Exception) -> bool:
     response = getattr(exc, "response", {})
     if not isinstance(response, dict):
@@ -220,23 +267,28 @@ def _remote_bytes(client, bucket: str, key: str, expected_sha256=None) -> bytes:
     return data
 
 
-def upload_file(client, bucket: str, prefix: str, run_id: str, role: str, file_path,
+def upload_file(store: Store, prefix: str, run_id: str, role: str, file_path,
                 platform=None) -> dict:
-    """Upload one byte snapshot once. Existing objects are verified, never replaced."""
+    """Upload one byte snapshot once into the platform's bucket; never replace objects."""
     # Upload exactly the bytes that were hashed, even if the file changes meanwhile.
     planned, data = _prepare(prefix, run_id, role, file_path, platform)
     key, digest = planned["key"], planned["sha256"]
+    bucket = store.bucket(planned["platform"])
+    client = store.writer()
     try:
         client.put_object(Bucket=bucket, Key=key, Body=data, IfNoneMatch="*",
                           Metadata={"sha256": digest})
         status = "uploaded"
     except Exception as exc:
+        if _access_denied(exc):
+            raise RuntimeError("This write key cannot write to the {} area (bucket {})."
+                               .format(planned["platform"], bucket)) from None
         if not _precondition_failed(exc):
             raise RuntimeError("R2 upload failed; check access and connection.") from None
         if _remote_bytes(client, bucket, key, digest) != data:
             raise RuntimeError("Existing object differs; upload refused.")
         status = "exists"
-    return dict(planned, status=status)
+    return dict(planned, bucket=bucket, status=status)
 
 
 def _parse_key(run_prefix: str, key: str, size) -> dict:
@@ -266,23 +318,36 @@ def _parse_key(run_prefix: str, key: str, size) -> dict:
     return entry
 
 
-def list_run(client, bucket: str, prefix: str, run_id: str) -> list[dict]:
-    """List every revision in one run. Irregular keys are flagged instead of failing."""
+def list_run(store: Store, prefix: str, run_id: str) -> list[dict]:
+    """List every revision of one run across the platform buckets.
+
+    Irregular keys, and objects kept in another platform's bucket, are flagged
+    instead of failing the whole listing.
+    """
     run_prefix = _run_prefix(prefix, run_id)
     result = []
-    try:
-        pages = client.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=run_prefix)
-        for page in pages:
-            for item in page.get("Contents", []):
-                key = item["Key"]
-                if not isinstance(key, str) or not key.startswith(run_prefix):
-                    raise ValueError("R2 returned an object outside the requested run.")
-                result.append(_parse_key(run_prefix, key, item.get("Size", 0)))
-    except ValueError:
-        raise
-    except Exception:
-        raise RuntimeError("R2 listing failed; check access and connection.") from None
-    return sorted(result, key=lambda entry: entry["key"])
+    for bucket, platforms in store.platforms_by_bucket().items():
+        try:
+            pages = store.read_client.get_paginator("list_objects_v2").paginate(
+                Bucket=bucket, Prefix=run_prefix)
+            for page in pages:
+                for item in page.get("Contents", []):
+                    key = item["Key"]
+                    if not isinstance(key, str) or not key.startswith(run_prefix):
+                        raise ValueError("R2 returned an object outside the requested run.")
+                    entry = _parse_key(run_prefix, key, item.get("Size", 0))
+                    if not entry["irregular"] and entry["platform"] not in platforms:
+                        entry = {"key": key, "size": entry["size"], "irregular": True,
+                                 "reason": "stored in the bucket for another platform"}
+                    entry["bucket"] = bucket
+                    result.append(entry)
+        except ValueError:
+            raise
+        except Exception as exc:
+            if _access_denied(exc):
+                raise RuntimeError("This read key cannot list bucket {}.".format(bucket)) from None
+            raise RuntimeError("R2 listing failed; check access and connection.") from None
+    return sorted(result, key=lambda entry: (entry["key"], entry["bucket"]))
 
 
 def _windows_directory_lock(path: Path, stack: ExitStack, allow_reparse: bool = False) -> None:
@@ -388,10 +453,10 @@ def _local_file(parent: Path, descriptor, filename: str, data: bytes, digest: st
     return target, True
 
 
-def irregular_local_name(run_prefix: str, key: str) -> str:
+def irregular_local_name(run_prefix: str, bucket: str, key: str) -> str:
     """A flat, escaped local filename for a key outside the layout (never a path)."""
     rest = key[len(run_prefix):]
-    tag = hashlib.sha256(key.encode("utf-8", "surrogatepass")).hexdigest()[:16]
+    tag = hashlib.sha256((bucket + "/" + key).encode("utf-8", "surrogatepass")).hexdigest()[:16]
     try:
         escaped = _percent(rest)
     except ValueError:
@@ -399,31 +464,32 @@ def irregular_local_name(run_prefix: str, key: str) -> str:
     return (tag + "_" + escaped)[:200]
 
 
-def download_run(client, bucket: str, prefix: str, run_id: str, output_dir) -> list[dict]:
-    """Pull every object of a run below output_dir.
+def download_run(store: Store, prefix: str, run_id: str, output_dir) -> list[dict]:
+    """Pull every object of a run, from all platform buckets, below output_dir.
 
     Regular objects go to {platform}/{role}/{sha256}/{filename} and are verified
     against the SHA-256 in their key. Irregular objects are saved, unverified,
     under _irregular/ with a flat escaped name, so they cannot leave output_dir.
     """
     run_prefix = _run_prefix(prefix, run_id)
-    objects = list_run(client, bucket, prefix, run_id)
+    objects = list_run(store, prefix, run_id)
     root = output_root(output_dir)
+    client = store.read_client
     results = []
     for item in objects:
-        record = {"key": item["key"], "irregular": item["irregular"]}
+        record = {"key": item["key"], "bucket": item["bucket"], "irregular": item["irregular"]}
         if item["irregular"]:
             if not isinstance(item["size"], int) or item["size"] > MAX_FILE_BYTES:
                 record.update(status="skipped", reason=item["reason"])
                 results.append(record)
                 continue
-            data = _remote_bytes(client, bucket, item["key"])
+            data = _remote_bytes(client, item["bucket"], item["key"])
             digest = hashlib.sha256(data).hexdigest()
             parts = (IRREGULAR_DIR,)
-            name = irregular_local_name(run_prefix, item["key"])
+            name = irregular_local_name(run_prefix, item["bucket"], item["key"])
             record.update(verified=False, sha256=digest, reason=item["reason"])
         else:
-            data = _remote_bytes(client, bucket, item["key"], item["sha256"])
+            data = _remote_bytes(client, item["bucket"], item["key"], item["sha256"])
             digest = item["sha256"]
             parts = (item["platform"], item["role"], digest)
             name = item["filename"]
@@ -451,19 +517,20 @@ def _found(pattern: re.Pattern, data: bytes) -> list[str]:
     return sorted({match.decode("ascii") for match in pattern.findall(data)})
 
 
-def locate_in_run(client, bucket: str, prefix: str, run_id: str, post_ids) -> list[dict]:
+def locate_in_run(store: Store, prefix: str, run_id: str, post_ids) -> list[dict]:
     """Find which objects of a run mention any of the post IDs (for manual deletion)."""
     pattern = post_id_pattern(post_ids)
     result = []
-    for item in list_run(client, bucket, prefix, run_id):
+    for item in list_run(store, prefix, run_id):
+        record = {"key": item["key"], "bucket": item["bucket"]}
         if not isinstance(item["size"], int) or item["size"] > MAX_FILE_BYTES:
-            result.append({"key": item["key"], "status": "skipped", "reason": "too large"})
+            result.append(dict(record, status="skipped", reason="too large"))
             continue
-        data = _remote_bytes(client, bucket, item["key"],
+        data = _remote_bytes(store.read_client, item["bucket"], item["key"],
                              None if item["irregular"] else item["sha256"])
         found = _found(pattern, data)
         if found:
-            result.append({"key": item["key"], "status": "found", "post_ids": found})
+            result.append(dict(record, status="found", post_ids=found))
     return result
 
 
@@ -490,59 +557,119 @@ def locate_in_directory(directory, post_ids) -> list[dict]:
     return result
 
 
-def delete_objects(client, bucket: str, prefix: str, run_id: str, keys, execute: bool = False) -> list[dict]:
+def delete_objects(store: Store, prefix: str, run_id: str, keys, execute: bool = False,
+                   bucket=None) -> list[dict]:
     """Delete listed keys of one run. Without execute, only report what would be deleted.
 
     Every key is checked against the current listing before anything is deleted.
+    A key found in more than one bucket must be narrowed with bucket.
     """
     keys = list(dict.fromkeys(keys))
     if not keys:
         raise ValueError("Give at least one --key.")
     run_prefix = _run_prefix(prefix, run_id)
-    present = {item["key"] for item in list_run(client, bucket, prefix, run_id)}
+    where = {}
+    for item in list_run(store, prefix, run_id):
+        if bucket is None or item["bucket"] == bucket:
+            where.setdefault(item["key"], []).append(item["bucket"])
+    targets = []
     for key in keys:
         if not isinstance(key, str) or not key.startswith(run_prefix):
             raise ValueError("Key is outside this run; nothing was deleted: {}".format(key))
-        if key not in present:
+        if key not in where:
             raise ValueError("Key is not in R2; nothing was deleted: {}".format(key))
+        if len(where[key]) > 1:
+            raise ValueError("Key is in several buckets; add --bucket. Nothing was deleted: {}"
+                             .format(key))
+        targets.append((where[key][0], key))
+    client = store.writer() if execute else None
     results = []
-    for key in keys:
-        if execute:
-            try:
-                client.delete_object(Bucket=bucket, Key=key)
-            except Exception:
-                raise RuntimeError("R2 delete failed at {}; earlier keys in this command were "
-                                   "deleted. Run list to check.".format(key)) from None
-            results.append({"key": key, "status": "deleted"})
-        else:
-            results.append({"key": key, "status": "would_delete"})
+    for target_bucket, key in targets:
+        record = {"key": key, "bucket": target_bucket}
+        if not execute:
+            results.append(dict(record, status="would_delete"))
+            continue
+        try:
+            client.delete_object(Bucket=target_bucket, Key=key)
+        except Exception as exc:
+            done = ", ".join(row["key"] for row in results) or "none"
+            if _access_denied(exc):
+                raise RuntimeError("This write key cannot delete in bucket {}. Already deleted: {}"
+                                   .format(target_bucket, done)) from None
+            raise RuntimeError("R2 delete failed at {}. Already deleted: {}"
+                               .format(key, done)) from None
+        results.append(dict(record, status="deleted"))
     return results
 
 
-def _client_from_env():
+_BUCKET_NAME = re.compile(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]\Z")
+
+
+def _buckets_from_env() -> dict:
+    split = {platform: os.environ.get("COMPSNS_R2_BUCKET_" + platform.upper(), "")
+             for platform in PLATFORMS}
+    single = os.environ.get("COMPSNS_R2_BUCKET", "")
+    if any(split.values()):
+        if not all(split.values()):
+            raise ValueError("Set all of COMPSNS_R2_BUCKET_X, COMPSNS_R2_BUCKET_THREADS and "
+                             "COMPSNS_R2_BUCKET_BOTH, or only COMPSNS_R2_BUCKET.")
+        buckets = split
+    elif single:
+        buckets = {platform: single for platform in PLATFORMS}
+    else:
+        raise ValueError("Set COMPSNS_R2_BUCKET_X, COMPSNS_R2_BUCKET_THREADS and "
+                         "COMPSNS_R2_BUCKET_BOTH (or COMPSNS_R2_BUCKET for one bucket).")
+    for name in set(buckets.values()):
+        if not _BUCKET_NAME.fullmatch(name):
+            raise ValueError("A bucket name is not valid: {}".format(name))
+    return buckets
+
+
+def _credentials(kind: str):
+    """Return (key id, secret) for 'WRITE' or 'READ', or None when not set."""
+    names = [("COMPSNS_R2_{}_ACCESS_KEY_ID".format(kind), "COMPSNS_R2_{}_SECRET_ACCESS_KEY".format(kind))]
+    if kind == "WRITE":
+        names.append(("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"))
+    for key_name, secret_name in names:
+        key_id, secret = os.environ.get(key_name, ""), os.environ.get(secret_name, "")
+        if key_id and secret:
+            return key_id, secret
+        if key_id or secret:
+            raise ValueError("Set both {} and {}.".format(key_name, secret_name))
+    return None
+
+
+def store_from_env(need_write: bool) -> Store:
     if sys.version_info < (3, 10):
         raise RuntimeError("R2 network commands require Python 3.10 or newer.")
-    names = ("COMPSNS_R2_ACCOUNT_ID", "COMPSNS_R2_BUCKET", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY")
-    if any(not os.environ.get(name) for name in names):
-        raise ValueError("Set COMPSNS_R2_ACCOUNT_ID, COMPSNS_R2_BUCKET, AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY.")
-    account = os.environ["COMPSNS_R2_ACCOUNT_ID"]
+    account = os.environ.get("COMPSNS_R2_ACCOUNT_ID", "")
     if not re.fullmatch(r"[0-9a-fA-F]{32}", account):
-        raise ValueError("COMPSNS_R2_ACCOUNT_ID must be a 32-character hexadecimal account ID.")
-    bucket = os.environ["COMPSNS_R2_BUCKET"]
-    if not re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", bucket):
-        raise ValueError("COMPSNS_R2_BUCKET is not a valid bucket name.")
+        raise ValueError("Set COMPSNS_R2_ACCOUNT_ID to the 32-character hexadecimal account ID.")
+    buckets = _buckets_from_env()
+    write = _credentials("WRITE")
+    read = _credentials("READ") or write
+    if need_write and write is None:
+        raise ValueError("This command needs a write key: set COMPSNS_R2_WRITE_ACCESS_KEY_ID and "
+                         "COMPSNS_R2_WRITE_SECRET_ACCESS_KEY.")
+    if read is None:
+        raise ValueError("Set a read key (COMPSNS_R2_READ_ACCESS_KEY_ID and "
+                         "COMPSNS_R2_READ_SECRET_ACCESS_KEY) or a write key.")
     try:
         import boto3
         from botocore.config import Config
     except ImportError:
         raise RuntimeError("Install the optional R2 SDK: python -m pip install -r requirements-r2.txt") from None
-    client = boto3.client("s3", endpoint_url="https://{}.r2.cloudflarestorage.com".format(account),
-                          region_name="auto", aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
-                          aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
-                          config=Config(signature_version="s3v4",
-                                        request_checksum_calculation="when_required",
-                                        response_checksum_validation="when_required"))
-    return client, bucket
+
+    def client(pair):
+        return boto3.client("s3", endpoint_url="https://{}.r2.cloudflarestorage.com".format(account),
+                            region_name="auto", aws_access_key_id=pair[0], aws_secret_access_key=pair[1],
+                            config=Config(signature_version="s3v4",
+                                          request_checksum_calculation="when_required",
+                                          response_checksum_validation="when_required"))
+
+    write_client = client(write) if write is not None else None
+    read_client = write_client if read == write else client(read)
+    return Store(buckets, read_client, write_client)
 
 
 def _emit(result) -> None:
@@ -586,6 +713,7 @@ def main(argv=None) -> int:
                                  help="Exact key from list or locate (repeatable).")
             command.add_argument("--yes", action="store_true",
                                  help="Actually delete. Without it, only show what would be deleted.")
+            command.add_argument("--bucket", help="Only when the same key is in several buckets.")
     args = parser.parse_args(argv)
     try:
         prefix = _prefix(os.environ.get("COMPSNS_R2_PREFIX", DEFAULT_PREFIX))
@@ -600,19 +728,19 @@ def main(argv=None) -> int:
                 raise ValueError("locate needs --run-id (R2) or --local (a folder).")
             if args.command == "locate":
                 post_id_pattern(_read_ids(args))
-            client, bucket = _client_from_env()
+            store = store_from_env(need_write=args.command == "upload"
+                                   or (args.command == "delete" and args.yes))
             if args.command == "upload":
-                result = upload_file(client, bucket, prefix, args.run_id, args.role, args.file,
-                                     args.platform)
+                result = upload_file(store, prefix, args.run_id, args.role, args.file, args.platform)
             elif args.command == "list":
-                result = list_run(client, bucket, prefix, args.run_id)
+                result = list_run(store, prefix, args.run_id)
             elif args.command == "pull":
                 output = args.output or ROOT / "data" / "runs" / args.run_id
-                result = download_run(client, bucket, prefix, args.run_id, output)
+                result = download_run(store, prefix, args.run_id, output)
             elif args.command == "locate":
-                result = locate_in_run(client, bucket, prefix, args.run_id, _read_ids(args))
+                result = locate_in_run(store, prefix, args.run_id, _read_ids(args))
             else:
-                result = delete_objects(client, bucket, prefix, args.run_id, args.key, args.yes)
+                result = delete_objects(store, prefix, args.run_id, args.key, args.yes, args.bucket)
         _emit(result)
         return 0
     except (ValueError, RuntimeError) as exc:

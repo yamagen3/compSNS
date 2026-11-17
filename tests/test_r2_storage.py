@@ -17,7 +17,8 @@ SPEC = importlib.util.spec_from_file_location("r2_storage", TOOL)
 r2 = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(r2)
 
-BUCKET = "offline-test-bucket"
+BUCKETS = {"x": "compsns-x", "threads": "compsns-threads", "both": "compsns-both"}
+BOTH = BUCKETS["both"]
 PREFIX = "compsns/v2"
 RUN = "READ-20261117-example"
 X_ID = "1989123456789012345"
@@ -34,18 +35,28 @@ class S3Error(Exception):
 
 
 class FakeS3:
-    """Small S3 behavioral fake with conditional writes and two-item pages."""
+    """Small S3 behavioral fake with conditional writes and two-item pages.
 
-    def __init__(self):
-        self.objects = {}
+    Several fakes can share one storage dict; writable limits which buckets a
+    key may write or delete in, like a bucket-scoped R2 token.
+    """
+
+    def __init__(self, objects=None, writable=None):
+        self.objects = {} if objects is None else objects
+        self.writable = writable
         self.put_calls = []
         self.list_calls = []
         self.delete_calls = []
         self.page_count = 0
         self.before_put = None
 
+    def _check_write(self, bucket):
+        if self.writable is not None and bucket not in self.writable:
+            raise S3Error("AccessDenied", 403)
+
     def put_object(self, **kwargs):
         self.put_calls.append(kwargs.copy())
+        self._check_write(kwargs["Bucket"])
         identity = (kwargs["Bucket"], kwargs["Key"])
         if kwargs.get("IfNoneMatch") == "*" and identity in self.objects:
             raise S3Error("PreconditionFailed", 412)
@@ -73,6 +84,7 @@ class FakeS3:
 
     def delete_object(self, **kwargs):
         self.delete_calls.append(kwargs.copy())
+        self._check_write(kwargs["Bucket"])
         self.objects.pop((kwargs["Bucket"], kwargs["Key"]), None)
         return {}
 
@@ -95,8 +107,8 @@ class FakeS3:
 
         return Paginator()
 
-    def seed(self, key, body):
-        self.objects[(BUCKET, key)] = {"body": body, "metadata": {}}
+    def seed(self, key, body, bucket=BOTH):
+        self.objects[(bucket, key)] = {"body": body, "metadata": {}}
 
 
 def files_under(path):
@@ -111,19 +123,21 @@ class R2StorageTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         self.client = FakeS3()
+        self.store = r2.Store(BUCKETS, self.client, self.client)
 
     def source(self, name="bundle.json", body=b'{"synthetic": true}\n'):
         path = self.root / name
         path.write_bytes(body)
         return path
 
-    def upload(self, path, run_id=RUN, role="reading", platform=None):
-        return r2.upload_file(self.client, BUCKET, PREFIX, run_id, role, path, platform)
+    def upload(self, path, run_id=RUN, role="reading", platform=None, store=None):
+        return r2.upload_file(store or self.store, PREFIX, run_id, role, path, platform)
 
-    def pull(self, output=None):
-        return r2.download_run(
-            self.client, BUCKET, PREFIX, RUN, output or self.root / "pulled"
-        )
+    def pull(self, output=None, store=None):
+        return r2.download_run(store or self.store, PREFIX, RUN, output or self.root / "pulled")
+
+    def listing(self, store=None):
+        return r2.list_run(store or self.store, PREFIX, RUN)
 
     def test_retry_preserves_remote_bytes_and_changed_file_creates_revision(self):
         original = b'{"revision": 1}\n'
@@ -137,17 +151,17 @@ class R2StorageTests(unittest.TestCase):
         second = self.upload(path)
         self.assertNotEqual(first["key"], second["key"])
         self.assertEqual(len(self.client.objects), 2)
-        self.assertEqual(self.client.objects[(BUCKET, first["key"])]["body"], original)
-        self.assertEqual(self.client.objects[(BUCKET, second["key"])]["body"], revised)
+        self.assertEqual(self.client.objects[(BOTH, first["key"])]["body"], original)
+        self.assertEqual(self.client.objects[(BOTH, second["key"])]["body"], revised)
         self.assertTrue(all(call.get("IfNoneMatch") == "*" for call in self.client.put_calls))
 
         # An existing key with dishonest metadata is never accepted as a safe retry.
         path.write_bytes(original)
-        self.client.objects[(BUCKET, first["key"])]["body"] = b"wrong remote bytes"
+        self.client.objects[(BOTH, first["key"])]["body"] = b"wrong remote bytes"
         with self.assertRaises((ValueError, RuntimeError)):
             self.upload(path)
         self.assertEqual(
-            self.client.objects[(BUCKET, first["key"])]["body"], b"wrong remote bytes"
+            self.client.objects[(BOTH, first["key"])]["body"], b"wrong remote bytes"
         )
 
     def test_x_and_threads_are_stored_and_pulled_into_separate_folders(self):
@@ -159,6 +173,10 @@ class R2StorageTests(unittest.TestCase):
         self.assertIn("/runs/%s/x/collector_x/" % RUN, x_row["key"])
         self.assertIn("/runs/%s/threads/collector_threads/" % RUN, t_row["key"])
         self.assertIn("/runs/%s/both/reading/" % RUN, both_row["key"])
+        self.assertEqual((x_row["bucket"], t_row["bucket"], both_row["bucket"]),
+                         (BUCKETS["x"], BUCKETS["threads"], BUCKETS["both"]))
+        self.assertIn((BUCKETS["x"], x_row["key"]), self.client.objects)
+        self.assertIn((BUCKETS["threads"], t_row["key"]), self.client.objects)
 
         output = self.root / "pulled"
         tops = {Path(row["path"]).relative_to(output.resolve()).parts[0] for row in self.pull(output)}
@@ -185,18 +203,20 @@ class R2StorageTests(unittest.TestCase):
         self.upload(self.source("neighbor.json"), run_id=RUN + "-neighbor")
         self.upload(self.source("other.json"), run_id="OTHER-RUN")
 
-        rows = r2.list_run(self.client, BUCKET, PREFIX, RUN)
+        rows = self.listing()
         self.assertEqual({row["key"] for row in rows}, expected)
         self.assertEqual(len(rows), 5)
         self.assertEqual(self.client.page_count, 3)
-        self.assertEqual(self.client.list_calls[0]["Prefix"], PREFIX + "/runs/" + RUN + "/")
+        self.assertEqual({call["Bucket"] for call in self.client.list_calls}, set(BUCKETS.values()))
+        self.assertEqual({call["Prefix"] for call in self.client.list_calls},
+                         {PREFIX + "/runs/" + RUN + "/"})
 
     def test_source_changes_during_send_cannot_mismatch_uploaded_digest(self):
         original = b"snapshot that was selected for upload"
         path = self.source(body=original)
         self.client.before_put = lambda: path.write_bytes(b"a concurrent local change")
         uploaded = self.upload(path)
-        stored = self.client.objects[(BUCKET, uploaded["key"])]["body"]
+        stored = self.client.objects[(BOTH, uploaded["key"])]["body"]
         self.assertEqual(stored, original)
         self.assertEqual(hashlib.sha256(stored).hexdigest(), uploaded["sha256"])
 
@@ -255,7 +275,7 @@ class R2StorageTests(unittest.TestCase):
         row = self.upload(self.source("収集レポート.md", b"japanese name"))
         self.assertTrue(row["key"].endswith("/" + cases["収集レポート.md"]))
         self.assertEqual(row["original_name"], "収集レポート.md")
-        listed = r2.list_run(self.client, BUCKET, PREFIX, RUN)
+        listed = self.listing()
         self.assertEqual(listed[0]["original_name"], "収集レポート.md")
         self.assertFalse(listed[0]["irregular"])
         pulled = self.pull()
@@ -279,7 +299,7 @@ class R2StorageTests(unittest.TestCase):
         ]
         for key in irregular_keys:
             self.client.seed(key, body)
-        rows = r2.list_run(self.client, BUCKET, PREFIX, RUN)
+        rows = self.listing()
         flagged = {row["key"] for row in rows if row["irregular"]}
         self.assertEqual(flagged, set(irregular_keys))
         self.assertEqual([row["key"] for row in rows if not row["irregular"]], [good["key"]])
@@ -340,21 +360,21 @@ class R2StorageTests(unittest.TestCase):
         drop = self.upload(self.source("drop.json", b"drop"))["key"]
         other_run = self.upload(self.source("other.json", b"other"), run_id="OTHER-RUN")["key"]
 
-        planned = r2.delete_objects(self.client, BUCKET, PREFIX, RUN, [drop])
-        self.assertEqual(planned, [{"key": drop, "status": "would_delete"}])
+        planned = r2.delete_objects(self.store, PREFIX, RUN, [drop])
+        self.assertEqual(planned, [{"key": drop, "bucket": BOTH, "status": "would_delete"}])
         self.assertEqual(self.client.delete_calls, [])
 
         for bad in ([drop, other_run], [drop, drop[:-1] + "x"]):
             with self.subTest(keys=bad):
                 with self.assertRaises(ValueError):
-                    r2.delete_objects(self.client, BUCKET, PREFIX, RUN, bad, execute=True)
+                    r2.delete_objects(self.store, PREFIX, RUN, bad, execute=True)
                 self.assertEqual(self.client.delete_calls, [])
 
-        done = r2.delete_objects(self.client, BUCKET, PREFIX, RUN, [drop], execute=True)
-        self.assertEqual(done, [{"key": drop, "status": "deleted"}])
-        remaining = {row["key"] for row in r2.list_run(self.client, BUCKET, PREFIX, RUN)}
+        done = r2.delete_objects(self.store, PREFIX, RUN, [drop], execute=True)
+        self.assertEqual(done, [{"key": drop, "bucket": BOTH, "status": "deleted"}])
+        remaining = {row["key"] for row in self.listing()}
         self.assertEqual(remaining, {keep})
-        self.assertIn((BUCKET, other_run), self.client.objects)
+        self.assertIn((BOTH, other_run), self.client.objects)
 
     def test_locate_finds_whole_ids_in_r2_and_in_local_copies(self):
         with_x = self.upload(self.source("collection_bundle_x_R.json",
@@ -364,7 +384,7 @@ class R2StorageTests(unittest.TestCase):
                                          ("https://www.threads.com/@a/post/%s" % THREADS_CODE).encode()),
                              role="collector_threads")["key"]
         self.upload(self.source("longer.json", ('{"n": "9%s0"}' % X_ID).encode()))
-        found = r2.locate_in_run(self.client, BUCKET, PREFIX, RUN, [X_ID, THREADS_CODE])
+        found = r2.locate_in_run(self.store, PREFIX, RUN, [X_ID, THREADS_CODE])
         self.assertEqual({row["key"]: row["post_ids"] for row in found},
                          {with_x: [X_ID], with_t: [THREADS_CODE]})
 
@@ -377,6 +397,97 @@ class R2StorageTests(unittest.TestCase):
             with self.subTest(ids=bad):
                 with self.assertRaises(ValueError):
                     r2.post_id_pattern(bad)
+
+    def test_write_keys_are_limited_to_their_own_bucket_and_reads_cover_all(self):
+        storage = self.client.objects
+        reader = FakeS3(storage, writable=set())
+        x_side = r2.Store(BUCKETS, reader, FakeS3(storage, writable={BUCKETS["x"]}))
+        threads_side = r2.Store(BUCKETS, reader, FakeS3(storage, writable={BUCKETS["threads"]}))
+        read_only = r2.Store(BUCKETS, reader)
+
+        x_file = self.source("collection_bundle_x_%s.json" % RUN, ('{"id": "%s"}' % X_ID).encode())
+        t_file = self.source("collection_bundle_threads_%s.json" % RUN, THREADS_CODE.encode())
+        x_key = self.upload(x_file, role="collector_x", store=x_side)["key"]
+        t_key = self.upload(t_file, role="collector_threads", store=threads_side)["key"]
+
+        with self.assertRaisesRegex(RuntimeError, "cannot write to the threads area"):
+            self.upload(t_file, role="collector_threads", store=x_side)
+        with self.assertRaisesRegex(RuntimeError, "cannot write to the x area"):
+            self.upload(x_file, role="collector_x", store=threads_side)
+        with self.assertRaisesRegex(RuntimeError, "cannot write to the both area"):
+            self.upload(self.source("note.md"), store=x_side)
+        with self.assertRaisesRegex(ValueError, "needs a write key"):
+            self.upload(x_file, role="collector_x", store=read_only)
+
+        # Both sides, and a read-only key, can read and pull everything.
+        for store in (x_side, threads_side, read_only):
+            with self.subTest(store=store):
+                self.assertEqual({row["key"] for row in self.listing(store)}, {x_key, t_key})
+        pulled = self.pull(self.root / "pulled", store=read_only)
+        self.assertEqual({Path(row["path"]).read_bytes() for row in pulled},
+                         {x_file.read_bytes(), t_file.read_bytes()})
+
+        # Deletion follows the same split: each side deletes only in its own bucket.
+        with self.assertRaisesRegex(RuntimeError, "cannot delete in bucket compsns-threads"):
+            r2.delete_objects(x_side, PREFIX, RUN, [t_key], execute=True)
+        with self.assertRaisesRegex(ValueError, "needs a write key"):
+            r2.delete_objects(read_only, PREFIX, RUN, [x_key], execute=True)
+        self.assertEqual(r2.delete_objects(read_only, PREFIX, RUN, [x_key])[0]["status"],
+                         "would_delete")
+        r2.delete_objects(threads_side, PREFIX, RUN, [t_key], execute=True)
+        self.assertEqual({row["key"] for row in self.listing(read_only)}, {x_key})
+
+    def test_object_in_another_platforms_bucket_is_flagged(self):
+        body = b"misplaced"
+        sha = hashlib.sha256(body).hexdigest()
+        key = r2.object_key(PREFIX, RUN, "threads", "collector_threads", sha, "t.json")
+        self.client.seed(key, body, bucket=BUCKETS["x"])
+        rows = self.listing()
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(rows[0]["irregular"])
+        self.assertEqual(rows[0]["bucket"], BUCKETS["x"])
+        self.assertIn("another platform", rows[0]["reason"])
+
+    def test_single_bucket_mode_still_works(self):
+        one = r2.Store({"x": "compsns-data", "threads": "compsns-data", "both": "compsns-data"},
+                       self.client, self.client)
+        self.assertFalse(one.partitioned)
+        self.assertTrue(self.store.partitioned)
+        row = self.upload(self.source("collection_bundle_x_R.json", b"x"), role="collector_x", store=one)
+        self.upload(self.source("collection_bundle_threads_R.json", b"t"), role="collector_threads",
+                    store=one)
+        self.assertEqual(row["bucket"], "compsns-data")
+        rows = self.listing(one)
+        self.assertEqual(len(rows), 2)
+        self.assertFalse(any(row["irregular"] for row in rows))
+        self.assertEqual(len(self.client.list_calls), 1)
+
+    def test_environment_selects_buckets_and_separate_keys(self):
+        from unittest import mock
+        clean = {name: value for name, value in os.environ.items()
+                 if not name.upper().startswith(("AWS_", "COMPSNS_"))}
+        split = {"COMPSNS_R2_BUCKET_X": "compsns-x", "COMPSNS_R2_BUCKET_THREADS": "compsns-threads",
+                 "COMPSNS_R2_BUCKET_BOTH": "compsns-both"}
+        with mock.patch.dict(os.environ, dict(clean, **split), clear=True):
+            self.assertEqual(r2._buckets_from_env(), BUCKETS)
+        with mock.patch.dict(os.environ, dict(clean, COMPSNS_R2_BUCKET="compsns-data"), clear=True):
+            self.assertEqual(set(r2._buckets_from_env().values()), {"compsns-data"})
+        partial = dict(clean, COMPSNS_R2_BUCKET_X="compsns-x", COMPSNS_R2_BUCKET="compsns-data")
+        with mock.patch.dict(os.environ, partial, clear=True):
+            with self.assertRaisesRegex(ValueError, "Set all of"):
+                r2._buckets_from_env()
+
+        keys = dict(clean, COMPSNS_R2_WRITE_ACCESS_KEY_ID="w", COMPSNS_R2_WRITE_SECRET_ACCESS_KEY="ws",
+                    COMPSNS_R2_READ_ACCESS_KEY_ID="r", COMPSNS_R2_READ_SECRET_ACCESS_KEY="rs")
+        with mock.patch.dict(os.environ, keys, clear=True):
+            self.assertEqual((r2._credentials("WRITE"), r2._credentials("READ")),
+                             (("w", "ws"), ("r", "rs")))
+        with mock.patch.dict(os.environ, dict(clean, AWS_ACCESS_KEY_ID="a", AWS_SECRET_ACCESS_KEY="as"),
+                             clear=True):
+            self.assertEqual((r2._credentials("WRITE"), r2._credentials("READ")), (("a", "as"), None))
+        with mock.patch.dict(os.environ, dict(clean, COMPSNS_R2_READ_ACCESS_KEY_ID="r"), clear=True):
+            with self.assertRaisesRegex(ValueError, "Set both"):
+                r2._credentials("READ")
 
     def test_help_plan_and_local_locate_work_without_credentials_sdk_or_network(self):
         source = self.source(body=("offline planning bytes " + X_ID).encode())
