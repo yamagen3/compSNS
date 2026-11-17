@@ -18,8 +18,10 @@ r2 = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(r2)
 
 BUCKET = "offline-test-bucket"
-PREFIX = "compsns/v1"
+PREFIX = "compsns/v2"
 RUN = "READ-20261117-example"
+X_ID = "1989123456789012345"
+THREADS_CODE = "C1aBcD2eFgH"
 
 
 class S3Error(Exception):
@@ -38,6 +40,7 @@ class FakeS3:
         self.objects = {}
         self.put_calls = []
         self.list_calls = []
+        self.delete_calls = []
         self.page_count = 0
         self.before_put = None
 
@@ -68,10 +71,10 @@ class FakeS3:
             "Metadata": obj["metadata"].copy(),
         }
 
-    def head_object(self, **kwargs):
-        response = self.get_object(**kwargs)
-        response.pop("Body")
-        return response
+    def delete_object(self, **kwargs):
+        self.delete_calls.append(kwargs.copy())
+        self.objects.pop((kwargs["Bucket"], kwargs["Key"]), None)
+        return {}
 
     def get_paginator(self, name):
         if name != "list_objects_v2":
@@ -96,6 +99,10 @@ class FakeS3:
         self.objects[(BUCKET, key)] = {"body": body, "metadata": {}}
 
 
+def files_under(path):
+    return sorted(p for p in Path(path).rglob("*") if p.is_file())
+
+
 class R2StorageTests(unittest.TestCase):
     def setUp(self):
         scratch = REPO / "data" / "test-tmp"
@@ -110,8 +117,8 @@ class R2StorageTests(unittest.TestCase):
         path.write_bytes(body)
         return path
 
-    def upload(self, path, run_id=RUN, role="reading"):
-        return r2.upload_file(self.client, BUCKET, PREFIX, run_id, role, path)
+    def upload(self, path, run_id=RUN, role="reading", platform=None):
+        return r2.upload_file(self.client, BUCKET, PREFIX, run_id, role, path, platform)
 
     def pull(self, output=None):
         return r2.download_run(
@@ -143,6 +150,33 @@ class R2StorageTests(unittest.TestCase):
             self.client.objects[(BUCKET, first["key"])]["body"], b"wrong remote bytes"
         )
 
+    def test_x_and_threads_are_stored_and_pulled_into_separate_folders(self):
+        x_file = self.source("collection_bundle_x_%s.json" % RUN, b"x data")
+        t_file = self.source("collection_bundle_threads_%s.json" % RUN, b"threads data")
+        x_row = self.upload(x_file, role="collector_x")
+        t_row = self.upload(t_file, role="collector_threads")
+        both_row = self.upload(self.source("reading_posts_%s.csv" % RUN, b"both"))
+        self.assertIn("/runs/%s/x/collector_x/" % RUN, x_row["key"])
+        self.assertIn("/runs/%s/threads/collector_threads/" % RUN, t_row["key"])
+        self.assertIn("/runs/%s/both/reading/" % RUN, both_row["key"])
+
+        output = self.root / "pulled"
+        tops = {Path(row["path"]).relative_to(output.resolve()).parts[0] for row in self.pull(output)}
+        self.assertEqual(tops, {"x", "threads", "both"})
+
+    def test_platform_mixups_are_refused(self):
+        with self.assertRaises(ValueError):
+            self.upload(self.source("collection_bundle_x_R.json"), role="collector_x",
+                        platform="threads")
+        with self.assertRaises(ValueError):
+            self.upload(self.source("collection_bundle_threads_R.json"), role="collector_x")
+        with self.assertRaises(ValueError):
+            self.upload(self.source("collection_bundle_x_R.json"), role="collector_threads")
+        with self.assertRaises(ValueError):
+            self.upload(self.source("coded.jsonl"), role="common_coder", platform="x")
+        self.assertEqual(self.client.objects, {})
+        self.assertIn("/x/reading/", self.upload(self.source("note.md"), platform="x")["key"])
+
     def test_listing_consumes_all_pages_and_does_not_leak_neighboring_runs(self):
         expected = set()
         for index in range(5):
@@ -172,14 +206,18 @@ class R2StorageTests(unittest.TestCase):
         path.write_bytes(b"second\x00revision\xfe")
         self.upload(path)
         output = self.root / "pulled"
-        files = self.pull(output)
+        rows = self.pull(output)
+        files = [Path(row["path"]) for row in rows]
         self.assertEqual(len(set(files)), 2)
+        self.assertEqual({row["status"] for row in rows}, {"saved"})
         self.assertEqual({file.read_bytes() for file in files}, {
             b"first\x00revision\xff", b"second\x00revision\xfe"
         })
         for file in files:
-            self.assertEqual(file.resolve().relative_to(output.resolve()).parts[0], "reading")
-        self.assertEqual(set(self.pull(output)), set(files))
+            self.assertEqual(file.relative_to(output.resolve()).parts[:2], ("both", "reading"))
+        again = self.pull(output)
+        self.assertEqual({Path(row["path"]) for row in again}, set(files))
+        self.assertEqual({row["status"] for row in again}, {"exists"})
 
         files[0].write_bytes(b"local edits to retain")
         with self.assertRaises((FileExistsError, ValueError, RuntimeError)):
@@ -189,43 +227,86 @@ class R2StorageTests(unittest.TestCase):
     def test_corrupt_download_is_rejected_before_saving_bytes(self):
         body = b"expected content"
         sha = hashlib.sha256(body).hexdigest()
-        key = r2.object_key(PREFIX, RUN, "reading", sha, "bundle.json")
+        key = r2.object_key(PREFIX, RUN, "both", "reading", sha, "bundle.json")
         self.client.seed(key, b"corrupt remote content")
         output = self.root / "pulled"
         with self.assertRaises((ValueError, RuntimeError)):
             self.pull(output)
-        self.assertFalse((output / "reading" / sha / "bundle.json").exists())
+        self.assertFalse((output / "both" / "reading" / sha / "bundle.json").exists())
 
-    def test_untrusted_remote_keys_cannot_escape_or_use_windows_device_names(self):
+    def test_irregular_filenames_are_escaped_not_rejected(self):
+        cases = {
+            "収集レポート.md": "%E5%8F%8E%E9%9B%86%E3%83%AC%E3%83%9D%E3%83%BC%E3%83%88.md",
+            "report (1).md": "report%20%281%29.md",
+            "CON.json": "%43ON.json",
+            "_memo.txt": "%5Fmemo.txt",
+            ".hidden": "%2Ehidden",
+            "a..b.csv": "a%2E%2Eb.csv",
+            "100%.md": "100%25.md",
+        }
+        for original, expected in cases.items():
+            with self.subTest(name=original):
+                self.assertEqual(r2.stored_name(original), expected)
+                self.assertEqual(r2.original_name(expected), original)
+        self.assertEqual(r2.stored_name("collection_bundle_x_R.json"), "collection_bundle_x_R.json")
+        with self.assertRaises(ValueError):
+            r2.stored_name("長" * 90 + ".md")
+
+        row = self.upload(self.source("収集レポート.md", b"japanese name"))
+        self.assertTrue(row["key"].endswith("/" + cases["収集レポート.md"]))
+        self.assertEqual(row["original_name"], "収集レポート.md")
+        listed = r2.list_run(self.client, BUCKET, PREFIX, RUN)
+        self.assertEqual(listed[0]["original_name"], "収集レポート.md")
+        self.assertFalse(listed[0]["irregular"])
+        pulled = self.pull()
+        self.assertEqual(Path(pulled[0]["path"]).name, cases["収集レポート.md"])
+        self.assertEqual(Path(pulled[0]["path"]).read_bytes(), b"japanese name")
+
+    def test_irregular_remote_keys_do_not_block_and_stay_inside_output(self):
+        good = self.upload(self.source(body=b"regular"))
         body = b"synthetic data"
         sha = hashlib.sha256(body).hexdigest()
-        start = PREFIX + "/runs/" + RUN + "/reading/" + sha + "/"
-        malicious_keys = [
+        start = PREFIX + "/runs/" + RUN + "/both/reading/" + sha + "/"
+        irregular_keys = [
             start + "../escape.json",
             start + "folder\\escape.json",
             start + "/absolute.json",
             start + "C:\\absolute.json",
             start + "CON",
-            start + "nul.json",
-            start + "trailing.",
+            start + "収集.json",
+            PREFIX + "/runs/" + RUN + "/dashboard upload.json",
+            PREFIX + "/runs/" + RUN + "/x/common_coder/" + sha + "/coded.jsonl",
         ]
-        for index, key in enumerate(malicious_keys):
-            with self.subTest(key=key):
-                self.client.objects.clear()
-                self.client.seed(key, body)
-                output = self.root / ("malicious%d" % index)
-                with self.assertRaises((ValueError, RuntimeError, OSError)):
-                    self.pull(output)
-                self.assertFalse(output.exists() and any(p.is_file() for p in output.rglob("*")))
+        for key in irregular_keys:
+            self.client.seed(key, body)
+        rows = r2.list_run(self.client, BUCKET, PREFIX, RUN)
+        flagged = {row["key"] for row in rows if row["irregular"]}
+        self.assertEqual(flagged, set(irregular_keys))
+        self.assertEqual([row["key"] for row in rows if not row["irregular"]], [good["key"]])
 
-    def test_pull_refuses_link_ancestor_and_keeps_external_directory_empty(self):
+        before = set(files_under(self.root))
+        output = self.root / "pulled"
+        pulled = self.pull(output)
+        created = set(files_under(self.root)) - before
+        self.assertEqual(len(created), len(irregular_keys) + 1)
+        irregular_dir = (output / r2.IRREGULAR_DIR).resolve()
+        for row in pulled:
+            path = Path(row["path"]).resolve()
+            if row["irregular"]:
+                self.assertEqual(path.parent, irregular_dir)
+                self.assertFalse(row["verified"])
+                self.assertEqual(path.read_bytes(), body)
+            else:
+                self.assertTrue(row["verified"])
+
+    def test_pull_refuses_link_inside_output_and_keeps_external_directory_empty(self):
         self.upload(self.source())
         output = self.root / "pulled"
         outside = self.root / "outside"
         output.mkdir()
         outside.mkdir()
         try:
-            (output / "reading").symlink_to(outside, target_is_directory=True)
+            (output / "both").symlink_to(outside, target_is_directory=True)
         except (OSError, NotImplementedError) as exc:
             if os.name != "nt":
                 self.skipTest("Directory symlinks unavailable: " + str(exc))
@@ -233,17 +314,74 @@ class R2StorageTests(unittest.TestCase):
                 # A junction exercises the same Windows reparse-point boundary
                 # without requiring the symbolic-link privilege on this host.
                 import _winapi
-                _winapi.CreateJunction(str(outside), str(output / "reading"))
+                _winapi.CreateJunction(str(outside), str(output / "both"))
             except (ImportError, AttributeError, OSError) as junction_error:
                 self.skipTest("Directory links unavailable: " + str(junction_error))
         with self.assertRaises((ValueError, RuntimeError, OSError)):
             self.pull(output)
         self.assertEqual(list(outside.iterdir()), [])
 
-    def test_help_and_plan_work_without_credentials_sdk_or_network(self):
-        source = self.source(body=b"offline planning bytes")
+    def test_pull_accepts_a_link_above_the_chosen_output(self):
+        self.upload(self.source(body=b"via link"))
+        real = self.root / "real"
+        real.mkdir()
+        link = self.root / "link"
+        try:
+            link.symlink_to(real, target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest("Directory symlinks unavailable: " + str(exc))
+        rows = self.pull(link / "data" / "runs" / RUN)
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(rows[0]["path"].startswith(str(real.resolve()) + os.sep))
+        self.assertEqual(Path(rows[0]["path"]).read_bytes(), b"via link")
+
+    def test_delete_is_a_dry_run_unless_confirmed_and_checks_every_key_first(self):
+        keep = self.upload(self.source("keep.json", b"keep"))["key"]
+        drop = self.upload(self.source("drop.json", b"drop"))["key"]
+        other_run = self.upload(self.source("other.json", b"other"), run_id="OTHER-RUN")["key"]
+
+        planned = r2.delete_objects(self.client, BUCKET, PREFIX, RUN, [drop])
+        self.assertEqual(planned, [{"key": drop, "status": "would_delete"}])
+        self.assertEqual(self.client.delete_calls, [])
+
+        for bad in ([drop, other_run], [drop, drop[:-1] + "x"]):
+            with self.subTest(keys=bad):
+                with self.assertRaises(ValueError):
+                    r2.delete_objects(self.client, BUCKET, PREFIX, RUN, bad, execute=True)
+                self.assertEqual(self.client.delete_calls, [])
+
+        done = r2.delete_objects(self.client, BUCKET, PREFIX, RUN, [drop], execute=True)
+        self.assertEqual(done, [{"key": drop, "status": "deleted"}])
+        remaining = {row["key"] for row in r2.list_run(self.client, BUCKET, PREFIX, RUN)}
+        self.assertEqual(remaining, {keep})
+        self.assertIn((BUCKET, other_run), self.client.objects)
+
+    def test_locate_finds_whole_ids_in_r2_and_in_local_copies(self):
+        with_x = self.upload(self.source("collection_bundle_x_R.json",
+                                         ('{"post_id": "%s"}' % X_ID).encode()),
+                             role="collector_x")["key"]
+        with_t = self.upload(self.source("collection_bundle_threads_R.json",
+                                         ("https://www.threads.com/@a/post/%s" % THREADS_CODE).encode()),
+                             role="collector_threads")["key"]
+        self.upload(self.source("longer.json", ('{"n": "9%s0"}' % X_ID).encode()))
+        found = r2.locate_in_run(self.client, BUCKET, PREFIX, RUN, [X_ID, THREADS_CODE])
+        self.assertEqual({row["key"]: row["post_ids"] for row in found},
+                         {with_x: [X_ID], with_t: [THREADS_CODE]})
+
+        output = self.root / "pulled"
+        self.pull(output)
+        local = r2.locate_in_directory(output, [X_ID])
+        self.assertEqual(len(local), 1)
+        self.assertIn(os.sep + "x" + os.sep + "collector_x" + os.sep, local[0]["path"])
+        for bad in ([], ["123"], ["has space"]):
+            with self.subTest(ids=bad):
+                with self.assertRaises(ValueError):
+                    r2.post_id_pattern(bad)
+
+    def test_help_plan_and_local_locate_work_without_credentials_sdk_or_network(self):
+        source = self.source(body=("offline planning bytes " + X_ID).encode())
         # A separate interpreter detects accidental eager SDK loading as well as
-        # credential discovery or network access during help and local planning.
+        # credential discovery or network access during help and local commands.
         wrapper = """
 import importlib.abc, runpy, socket, sys
 class NoSDK(importlib.abc.MetaPathFinder):
@@ -261,24 +399,30 @@ runpy.run_path(sys.argv[0], run_name='__main__')
 """
         environment = {
             name: value for name, value in os.environ.items()
-            if not name.upper().startswith(("AWS_", "R2_", "CLOUDFLARE_"))
+            if not name.upper().startswith(("AWS_", "R2_", "CLOUDFLARE_", "COMPSNS_"))
         }
         environment["PYTHONDONTWRITEBYTECODE"] = "1"
+        environment["PYTHONIOENCODING"] = "utf-8"
         commands = [
             ["--help"],
             ["plan", "--run-id", RUN, "--role", "reading", "--file", str(source)],
+            ["locate", "--local", str(self.root), "--id", X_ID],
         ]
         for arguments in commands:
             with self.subTest(arguments=arguments):
                 result = subprocess.run(
                     [sys.executable, "-B", "-c", wrapper, str(TOOL)] + arguments,
-                    cwd=REPO, env=environment, capture_output=True, text=True, timeout=15,
+                    cwd=REPO, env=environment, capture_output=True, text=True,
+                    encoding="utf-8", timeout=15,
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 if arguments[0] == "plan":
                     self.assertIn(hashlib.sha256(source.read_bytes()).hexdigest(), result.stdout)
-                    self.assertIn(RUN, result.stdout)
+                    self.assertIn(RUN + "/both/reading/", result.stdout)
                     self.assertIn(source.name, result.stdout)
+                elif arguments[0] == "locate":
+                    self.assertIn(source.name, result.stdout)
+                    self.assertIn(X_ID, result.stdout)
                 else:
                     self.assertIn("usage", result.stdout.lower())
 
