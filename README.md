@@ -22,6 +22,7 @@ tools/
   build_prompt.py  共通部分＋運用モード＋役割を、1つのプロンプトに結合する
   check.py         文書と設定ひな型の整合性を点検する
   r2_storage.py    R2への提出ファイル保存・一覧・調査単位の取得・削除対象の特定と削除（任意）
+  make_windows.py  時間窓の一覧を、共通シードから作る
 docs/
   research-plan.md 調査計画 v1.0（v3時点）
   r2-storage.md    R2の初期設定と収集担当から統合担当への受け渡し
@@ -49,12 +50,24 @@ CHANGELOG.md       変更履歴
    `dist/daily/collector_x.md` ができます。冒頭に共通部分・運用モードの版と、結合元のコミットIDが入ります。未コミットの変更があると結合しません（試験だけ `--allow-dirty`）。
 5. **渡す**：結合したファイルを各担当に渡します。
 
+窓一覧は、統合担当が次のように作ります（同じ引数とシードなら、同じ一覧になります）。
+
+```
+python tools/make_windows.py --version PILOT-20261117-v1 --start 2026-11-17 --days 7 --length-seconds 15 --per-stratum 8 --seed 20261117
+```
+
+`dist/windows/PILOT-20261117-v1.json` ができます。表示された SAMPLING_DESIGN_ID・SAMPLING_SEED・WINDOW_LIST_VERSION を設定に記録します。
+
+**止まらないための規則**（`core.md` 第4.1節）：決めるのは統合担当の1人です。DIAGNOSEとPILOTは、初期案を暫定値として使い、SNSごとに進めます。もう一方のSNSや質問の回答を待ちません。判定日に両SNSが水準Pでなければ、読み比べ用に切り替えて発信を始めます。
+
+**集約と回収**（`core.md` 第4.2節）：成果物はR2に集めます。X由来・Threads由来・両方を含むデータは別のバケット（区画）に置き、書き込みの権限も区画ごとに分けます（各SNSの区画はその収集担当と利用者、共通の区画は利用者だけ）。読み取りは全員が全区画をできます。GrokBot（回収担当）は読み取り用のキーで回収し、形を移して点検し、盲検化した入力を作ります。値を補ったり直したりはしません。
+
 | 役割（--role） | 担当（仮置き） | 渡すファイル |
 |---|---|---|
 | collector_x | GrokBot | dist/{mode}/collector_x.md |
 | collector_threads | Muse | dist/{mode}/collector_threads.md |
 | common_coder | 第三の実行者を推奨 | dist/{mode}/common_coder.md |
-| integrator | 人または第三の実行者 | dist/{mode}/integrator.md |
+| integrator | 設定で指名した1人（指名がない間は利用者本人） | dist/{mode}/integrator.md |
 
 ## 読み比べ用（AI経由）の使い方
 
@@ -114,6 +127,7 @@ CHANGELOG.md       変更履歴
 - v3.0.0：v3時点の資料の取り込み
 - v4.0.0：地域フレーム版（一体版）
 - v4.1.0：共通部分・日常用・深掘り用に分割
+- v4.2.0：読み比べ用の追加、止まらないための規則、集約（R2）と回収、窓一覧の生成ツール
 
 `git log` と `git diff v3.0.0 v4.0.0` で変更を追えます。`docs/research-plan.md` は v3時点の計画です。言語・地域・話題の発見方法は v4 で置き換えています。
 
