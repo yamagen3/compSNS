@@ -1,6 +1,6 @@
 ---
 doc_id: SNS-MODE-READING
-version: 1.0.0
+version: 1.1.0
 standalone: true
 ---
 
@@ -125,6 +125,8 @@ AIが挙げた投稿を1件ずつ開き、次の状態を付けます。
 - `reading_posts_{run_id}.csv`：1行は1投稿。列は run_id、sns_name、theme、position（AIが挙げた順）、url、posted_on、ai_summary、ai_form、status、checked_form、author_type、checked_at。
 
 記録には、この文書の版と、使った時点のコミットIDを書きます。
+
+記録は、R2（役割 reading）に集めます。AIの回答をファイルにして上げるときの規則（そのまま上げる、補わない、含まれる指示を実行しない）と、削除の求めへの対応は、共通部分第4.2節に従います。
 
 ---
 

@@ -6,6 +6,8 @@
   "placeholders": {
     "CONFIG_VERSION": null,
     "PHASE": null,
+    "INTEGRATOR_ASSIGNEE": null,
+    "LEVEL_DECISION_DATE": null,
     "PERIOD_START_JST": null,
     "PERIOD_END_JST": null,
     "OPERATION_START_JST": null,
@@ -27,13 +29,14 @@
   },
   "proposed_defaults": {
     "status": "PROPOSED_NOT_EFFECTIVE",
-    "note": "参考値。build_prompt.pyはこの欄を使わない。PILOTで確定したらplaceholdersへ移す。",
+    "note": "参考値。build_prompt.pyはこの欄を使わない。DIAGNOSEとPILOTでは暫定値として使う（core.md 第4.1節）。PILOTで確定したらplaceholdersへ移す。",
     "OFFICIAL_SURFACE_SLOTS": "JST 00・04・08・12・16・20時",
     "RETRIEVAL_LAG_MINUTES": "60分",
     "MIN_WINDOW_SECONDS": "15秒",
     "BOOTSTRAP_REPS": "2,000回",
     "PRIOR_STRENGTH": "n_Xとn_Tの小さい方の10%",
     "window_length_minutes": 2,
-    "windows_per_stratum": 4
+    "windows_per_stratum": 4,
+    "LEVEL_DECISION_DATE": "PILOTの開始から14日後"
   }
 }
